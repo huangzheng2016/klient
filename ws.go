@@ -335,6 +335,10 @@ func containsString(items []string, want string) bool {
 	return false
 }
 
+const rawFrameQueueSize = 64
+
+var errRawFrameQueueFull = errors.New("klient: raw frame queue full")
+
 func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, ch chan<- Event, subscription *Subscription, mapper *transcriptEventMapper, pending []wsFrame) {
 	defer close(ch)
 	defer conn.Close(websocket.StatusNormalClosure, "")
@@ -342,14 +346,23 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, ch chan<- E
 		c.putTranscriptMapper(mapper.sessionID, mapper)
 	}()
 
+	readerCtx, cancelReader := context.WithCancel(ctx)
+	rawFrames := make(chan wsFrame, rawFrameQueueSize)
+	readerResult := make(chan error, 1)
+	var readerWG sync.WaitGroup
+	readerWG.Add(1)
+	go func() {
+		defer readerWG.Done()
+		readerResult <- runWSReader(readerCtx, conn, pending, rawFrames)
+		close(rawFrames)
+	}()
+	defer func() {
+		cancelReader()
+		conn.CloseNow()
+		readerWG.Wait()
+	}()
+
 	process := func(frame wsFrame) bool {
-		if frame.Type == "ping" {
-			if err := answerPing(ctx, conn, frame.Payload); err != nil {
-				emitStreamError(ctx, ch, err)
-				return false
-			}
-			return true
-		}
 		working := mapper.clone()
 		events, fatal, err := mapWSFrame(working, frame)
 		if err != nil {
@@ -368,21 +381,52 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, ch chan<- E
 		return !fatal
 	}
 
-	for _, frame := range pending {
+	for frame := range rawFrames {
 		if !process(frame) {
 			return
+		}
+	}
+	if err := <-readerResult; err != nil && ctx.Err() == nil {
+		emitStreamError(ctx, ch, err)
+	}
+}
+
+func runWSReader(ctx context.Context, conn *websocket.Conn, pending []wsFrame, rawFrames chan<- wsFrame) error {
+	send := func(frame wsFrame) error {
+		if frame.Type == "ping" {
+			return answerPing(ctx, conn, frame.Payload)
+		}
+		select {
+		case rawFrames <- frame:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			conn.CloseNow()
+			return errRawFrameQueueFull
+		}
+	}
+	for _, frame := range pending {
+		if err := send(frame); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
 		}
 	}
 	for {
 		frame, err := readWSFrame(ctx, conn)
 		if err != nil {
-			if ctx.Err() == nil && websocket.CloseStatus(err) != websocket.StatusNormalClosure {
-				emitStreamError(ctx, ch, err)
+			if ctx.Err() != nil || websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+				return nil
 			}
-			return
+			return err
 		}
-		if !process(frame) {
-			return
+		if err := send(frame); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
 		}
 	}
 }

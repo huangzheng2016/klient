@@ -996,3 +996,140 @@ func TestSnapshotResetKeyNormalizesHasMoreOlder(t *testing.T) {
 		t.Fatalf("reset key changed across equivalent HasMore representations: before %q after %q", want, got)
 	}
 }
+
+func TestPingAnsweredWhileConsumerBlocked(t *testing.T) {
+	batch := transcriptOps("main", 1,
+		`{"op":"frame.upsert","turnId":"t1","stepId":"t1.1","frame":{"kind":"text","frameId":"f1","role":"assistant","text":"A"}}`,
+		`{"op":"frame.upsert","turnId":"t1","stepId":"t1.1","frame":{"kind":"text","frameId":"f2","role":"assistant","text":"B"}}`)
+	pong := make(chan error, 1)
+	ts := newWSTestServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		if err := writeAll(ctx, conn, transcriptReset("main", 0, ""), batch); err != nil {
+			pong <- err
+			return
+		}
+		ping := `{"type":"ping","timestamp":"2026-01-01T00:00:00Z","payload":{"nonce":"blocked-consumer"}}`
+		if err := conn.Write(ctx, websocket.MessageText, []byte(ping)); err != nil {
+			pong <- err
+			return
+		}
+		readCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer cancel()
+		_, data, err := conn.Read(readCtx)
+		if err != nil {
+			pong <- err
+			return
+		}
+		var frame map[string]any
+		if err := json.Unmarshal(data, &frame); err != nil {
+			pong <- err
+			return
+		}
+		if frame["type"] != "pong" {
+			pong <- fmt.Errorf("frame type = %v, want pong", frame["type"])
+			return
+		}
+		payload, _ := frame["payload"].(map[string]any)
+		if payload["nonce"] != "blocked-consumer" {
+			pong <- fmt.Errorf("pong nonce = %v", payload["nonce"])
+			return
+		}
+		pong <- nil
+	})
+	sub, err := New(ts.srv.URL, "").Subscribe(context.Background(), "s1", Cursor{})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+	select {
+	case err := <-pong:
+		if err != nil {
+			t.Fatalf("pong was not answered while consumer blocked: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not observe a pong")
+	}
+	if got := sub.Cursor().TranscriptSince["main"]; got != 0 {
+		t.Fatalf("cursor advanced before blocked batch delivery: main=%d", got)
+	}
+}
+
+func TestRawQueueBackpressureClosesAndSurfacesError(t *testing.T) {
+	serverClosed := make(chan error, 1)
+	batch := transcriptOps("main", 1,
+		`{"op":"frame.upsert","turnId":"t1","stepId":"t1.1","frame":{"kind":"text","frameId":"f1","role":"assistant","text":"first"}}`)
+	ts := newWSTestServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		if err := writeAll(ctx, conn, transcriptReset("main", 0, ""), batch); err != nil {
+			serverClosed <- err
+			return
+		}
+		ack := []byte(`{"type":"ack","id":"queued","code":0,"msg":"success","payload":{}}`)
+		for range rawFrameQueueSize + 1 {
+			if err := conn.Write(ctx, websocket.MessageText, ack); err != nil {
+				serverClosed <- err
+				return
+			}
+		}
+		_, _, err := conn.Read(ctx)
+		serverClosed <- err
+	})
+	sub, err := New(ts.srv.URL, "").Subscribe(context.Background(), "s1", Cursor{})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+	select {
+	case err := <-serverClosed:
+		if err == nil {
+			t.Fatal("server observed a clean close before backpressure was reported")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not observe backpressure close")
+	}
+	if ev := recvEvent(t, sub.Events); ev.Type != TypeAssistantDelta {
+		t.Fatalf("event before backpressure = %+v", ev)
+	}
+	ev := recvEvent(t, sub.Events)
+	if ev.Type != TypeReadError || !strings.Contains(string(ev.Payload), "raw frame queue full") {
+		t.Fatalf("backpressure event = %+v %s", ev, ev.Payload)
+	}
+	waitClosed(t, sub.Events)
+}
+
+func TestCloseWhileDeliveryAndReaderBlocked(t *testing.T) {
+	handlerDone := make(chan struct{})
+	batch := transcriptOps("main", 1,
+		`{"op":"frame.upsert","turnId":"t1","stepId":"t1.1","frame":{"kind":"text","frameId":"f1","role":"assistant","text":"A"}}`,
+		`{"op":"frame.upsert","turnId":"t1","stepId":"t1.1","frame":{"kind":"text","frameId":"f2","role":"assistant","text":"B"}}`)
+	ts := newWSTestServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		defer close(handlerDone)
+		_ = writeAll(ctx, conn, transcriptReset("main", 0, ""), batch)
+		_, _, _ = conn.Read(ctx)
+	})
+	c := New(ts.srv.URL, "")
+	sub, err := c.Subscribe(context.Background(), "s1", Cursor{})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		sub.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscription.Close blocked while delivery and reader were blocked")
+	}
+	waitClosed(t, sub.Events)
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server handler did not exit after Subscription.Close")
+	}
+	c.streamMu.Lock()
+	_, active := c.active["s1"]
+	c.streamMu.Unlock()
+	if active {
+		t.Fatal("session remained active after Subscription.Close")
+	}
+}

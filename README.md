@@ -30,6 +30,8 @@ go get github.com/huangzheng2016/klient
   - Tracks per-agent sequence cursors, suppresses replay duplicates, and detects sequence and append gaps.
   - Numbers each mapped transcript event with `EventIndex` from zero within its WS reset/ops frame. `(AgentID, Seq, EventIndex)` is the batch-scoped deduplication key for transcript events; lifecycle events with `Seq=0` do not use that key.
   - Applies external `transcript.reset` incrementally against cached state so old frames are not replayed, while explicit `op=reset` retains its clearing/undo semantics.
+  - Reads raw frames and answers ping independently of transcript mapping and event delivery, so a slow consumer cannot block heartbeat responses.
+  - Uses a bounded 64-frame raw queue. Saturation closes the connection and surfaces `klient.read_error` after already queued events, allowing replay from the last committed cursor without silently dropping frames.
   - Commits cursor and cache only after every mapped event in a transcript batch has been received. Closing mid-batch replays that batch on reconnect, favoring duplicates over event loss.
   - Preserves split UTF-16 surrogate pairs across transcript messages without emitting unpaired surrogates.
   - Preserves transcript state across reconnects on the same `Client`; `Subscription.Cursor()` returns the latest committed per-agent cursor.
