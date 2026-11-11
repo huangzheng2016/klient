@@ -4,21 +4,12 @@ import (
 	"encoding/json"
 )
 
-// KAPMapper normalizes raw KAP WebSocket events into standard trace event kinds
-// ("think", "text", "tool_call", "tool_result", "step_begin", "turn_end",
-// "usage", "error", "end"), converting cumulative KAP usage snapshots into
-// per-update token deltas and filtering sub-agent prompt completions.
 type KAPMapper struct {
-	MainPromptID           string
-	SkipFirstUsage         bool
-	lastUsageIn            int64
-	lastUsageOut           int64
-	lastUsageCacheRead     int64
-	lastUsageCacheCreation int64
-	hasLastUsage           bool
+	MainPromptID  string
+	models        map[string]string
+	contextTokens map[string]int64
 }
 
-// TraceMapper is an alias for KAPMapper.
 type TraceMapper = KAPMapper
 
 func (m *KAPMapper) Map(ev Event) (string, json.RawMessage, bool) {
@@ -73,6 +64,24 @@ func (m *KAPMapper) Map(ev Event) (string, json.RawMessage, bool) {
 		return "step_begin", kapPayload(map[string]any{
 			"turn_id": p.TurnID, "step": p.Step, "step_id": p.StepID,
 		}), true
+	case TypeTurnStepComplete:
+		var p TurnStepCompletedPayload
+		if err := ev.Decode(&p); err != nil || p.Usage == nil {
+			return "", nil, false
+		}
+		cacheRead := p.Usage.InputCacheRead
+		cacheCreation := p.Usage.InputCacheCreation
+		in := p.Usage.InputOther + cacheRead + cacheCreation
+		out := p.Usage.Output
+		if in <= 0 && out <= 0 {
+			return "", nil, false
+		}
+		agentID := kapMapperAgentID(ev.AgentID, p.AgentID)
+		return "usage", kapPayload(map[string]any{
+			"input_tokens": in, "output_tokens": out,
+			"cache_read": cacheRead, "cache_creation": cacheCreation,
+			"context_tokens": m.contextTokens[agentID], "model": m.models[agentID],
+		}), true
 	case TypeTurnEnded:
 		var p TurnEndedPayload
 		if err := ev.Decode(&p); err != nil {
@@ -88,37 +97,24 @@ func (m *KAPMapper) Map(ev Event) (string, json.RawMessage, bool) {
 		}), true
 	case TypeAgentStatus:
 		var p AgentStatusPayload
-		if err := ev.Decode(&p); err != nil || p.Usage == nil || p.Usage.Total == nil {
+		if err := ev.Decode(&p); err != nil {
 			return "", nil, false
 		}
-		totalCacheRead := p.Usage.Total.InputCacheRead
-		totalCacheCreation := p.Usage.Total.InputCacheCreation
-		totalIn := p.Usage.Total.InputOther + totalCacheRead + totalCacheCreation
-		totalOut := p.Usage.Total.Output
-		in, out := totalIn, totalOut
-		cacheRead, cacheCreation := totalCacheRead, totalCacheCreation
-		if m.hasLastUsage && totalIn >= m.lastUsageIn && totalOut >= m.lastUsageOut &&
-			totalCacheRead >= m.lastUsageCacheRead && totalCacheCreation >= m.lastUsageCacheCreation {
-			in = totalIn - m.lastUsageIn
-			out = totalOut - m.lastUsageOut
-			cacheRead = totalCacheRead - m.lastUsageCacheRead
-			cacheCreation = totalCacheCreation - m.lastUsageCacheCreation
+		if m.models == nil {
+			m.models = make(map[string]string)
 		}
-		first := !m.hasLastUsage
-		m.lastUsageIn, m.lastUsageOut = totalIn, totalOut
-		m.lastUsageCacheRead, m.lastUsageCacheCreation = totalCacheRead, totalCacheCreation
-		m.hasLastUsage = true
-		if first && m.SkipFirstUsage {
+		m.models[kapMapperAgentID(ev.AgentID, p.AgentID)] = p.Model
+		return "", nil, false
+	case TypeUsage:
+		var p UsageContextPayload
+		if err := ev.Decode(&p); err != nil {
 			return "", nil, false
 		}
-		if in <= 0 && out <= 0 {
-			return "", nil, false
+		if m.contextTokens == nil {
+			m.contextTokens = make(map[string]int64)
 		}
-		return "usage", kapPayload(map[string]any{
-			"input_tokens": in, "output_tokens": out,
-			"cache_read": cacheRead, "cache_creation": cacheCreation,
-			"context_tokens": p.ContextTokens, "model": p.Model,
-		}), true
+		m.contextTokens[kapMapperAgentID(ev.AgentID, p.AgentID)] = p.ContextTokens
+		return "", nil, false
 	case TypeError:
 		var p ErrorPayload
 		if err := ev.Decode(&p); err != nil {
@@ -142,7 +138,8 @@ func (m *KAPMapper) Map(ev Event) (string, json.RawMessage, bool) {
 		if err := ev.Decode(&p); err != nil {
 			return "", nil, false
 		}
-		if m.MainPromptID == "" || p.PromptID != m.MainPromptID {
+		if m.MainPromptID == "" || p.PromptID != m.MainPromptID ||
+			(ev.AgentID != "" && ev.AgentID != "main") {
 			return "", nil, false
 		}
 		return "end", kapPayload(map[string]any{
@@ -150,6 +147,16 @@ func (m *KAPMapper) Map(ev Event) (string, json.RawMessage, bool) {
 		}), true
 	}
 	return "", nil, false
+}
+
+func kapMapperAgentID(eventAgentID, payloadAgentID string) string {
+	if eventAgentID != "" {
+		return eventAgentID
+	}
+	if payloadAgentID != "" {
+		return payloadAgentID
+	}
+	return "main"
 }
 
 func kapPayload(v map[string]any) json.RawMessage {

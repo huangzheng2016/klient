@@ -5,23 +5,36 @@ import (
 )
 
 type Cursor struct {
-	Seq   int64  `json:"seq"`
-	Epoch string `json:"epoch"`
+	TranscriptSince map[string]int64 `json:"transcript_since,omitempty"`
+	baseline        map[string]transcriptSnapshot
+}
+
+func (c Cursor) clone() Cursor {
+	out := Cursor{
+		TranscriptSince: make(map[string]int64, len(c.TranscriptSince)),
+		baseline:        make(map[string]transcriptSnapshot, len(c.baseline)),
+	}
+	for agentID, seq := range c.TranscriptSince {
+		out.TranscriptSince[agentID] = seq
+	}
+	for agentID, snapshot := range c.baseline {
+		out.baseline[agentID] = snapshot
+	}
+	return out
 }
 
 type Event struct {
-	Type      string
-	Seq       int64
-	Epoch     string
-	SessionID string
-	Payload   json.RawMessage
+	Type       string
+	Seq        int64
+	EventIndex int
+	SessionID  string
+	AgentID    string
+	Payload    json.RawMessage
 }
 
 func (e Event) Decode(v any) error {
 	return json.Unmarshal(e.Payload, v)
 }
-
-const TypeResyncRequired = "resync_required"
 
 const TypeReadError = "klient.read_error"
 
@@ -38,7 +51,10 @@ const (
 	TypeToolResult               = "tool.result"
 	TypeTurnStepStarted          = "turn.step.started"
 	TypeTurnStepComplete         = "turn.step.completed"
+	TypeTurnStepInterrupted      = "turn.step.interrupted"
+	TypeTurnStepRetrying         = "turn.step.retrying"
 	TypeAgentStatus              = "agent.status.updated"
+	TypeUsage                    = "usage"
 	TypePromptCompleted          = "prompt.completed"
 	TypePromptAborted            = "prompt.aborted"
 	TypeError                    = "error"
@@ -47,23 +63,36 @@ const (
 	TypeTaskStarted              = "task.started"
 	TypeTaskTerminated           = "task.terminated"
 	TypeTaskNotified             = "task.notified"
-	TypeTaskWaitDelivered        = "task.waitDelivered"
+	TypeTaskList                 = "task.list"
+	TypeTaskOutput               = "task.output"
 	TypeBackgroundTaskStarted    = "background.task.started"
 	TypeBackgroundTaskTerminated = "background.task.terminated"
+	TypeSubagentSpawned          = "subagent.spawned"
 )
 
+type EventIdentity struct {
+	AgentID   string `json:"agentId,omitempty"`
+	SessionID string `json:"sessionId,omitempty"`
+}
+
 type PromptOrigin struct {
-	Kind string `json:"kind"`
+	Kind    string          `json:"kind"`
+	TaskID  string          `json:"taskId,omitempty"`
+	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
 type TurnStartedPayload struct {
-	TurnID int64        `json:"turnId"`
-	Origin PromptOrigin `json:"origin"`
-	Prompt string       `json:"prompt,omitempty"`
+	EventIdentity
+	TurnID   string       `json:"turnId"`
+	PromptID string       `json:"promptId,omitempty"`
+	Origin   PromptOrigin `json:"origin"`
+	Prompt   string       `json:"prompt,omitempty"`
 }
 
 type TurnEndedPayload struct {
-	TurnID          int64         `json:"turnId"`
+	EventIdentity
+	TurnID          string        `json:"turnId"`
+	PromptID        string        `json:"promptId,omitempty"`
 	Reason          string        `json:"reason"`
 	Error           *ErrorPayload `json:"error,omitempty"`
 	DurationMs      int64         `json:"durationMs,omitempty"`
@@ -72,25 +101,30 @@ type TurnEndedPayload struct {
 }
 
 type AssistantDeltaPayload struct {
-	TurnID int64  `json:"turnId"`
+	EventIdentity
+	TurnID string `json:"turnId"`
 	Delta  string `json:"delta"`
 }
 
 type ThinkingDeltaPayload struct {
-	TurnID int64  `json:"turnId"`
+	EventIdentity
+	TurnID string `json:"turnId"`
 	Delta  string `json:"delta"`
 }
 
 type ToolCallStartedPayload struct {
-	TurnID      int64           `json:"turnId"`
+	EventIdentity
+	TurnID      string          `json:"turnId"`
 	ToolCallID  string          `json:"toolCallId"`
 	Name        string          `json:"name"`
 	Args        json.RawMessage `json:"args"`
 	Description string          `json:"description,omitempty"`
+	Display     json.RawMessage `json:"display,omitempty"`
 }
 
 type ToolCallDeltaPayload struct {
-	TurnID        int64  `json:"turnId"`
+	EventIdentity
+	TurnID        string `json:"turnId"`
 	ToolCallID    string `json:"toolCallId"`
 	Name          string `json:"name,omitempty"`
 	ArgumentsPart string `json:"argumentsPart,omitempty"`
@@ -105,13 +139,15 @@ type ToolUpdate struct {
 }
 
 type ToolProgressPayload struct {
-	TurnID     int64      `json:"turnId"`
+	EventIdentity
+	TurnID     string     `json:"turnId"`
 	ToolCallID string     `json:"toolCallId"`
 	Update     ToolUpdate `json:"update"`
 }
 
 type ToolResultPayload struct {
-	TurnID     int64           `json:"turnId"`
+	EventIdentity
+	TurnID     string          `json:"turnId"`
 	ToolCallID string          `json:"toolCallId"`
 	Output     json.RawMessage `json:"output"`
 	IsError    bool            `json:"isError,omitempty"`
@@ -119,17 +155,35 @@ type ToolResultPayload struct {
 }
 
 type TurnStepPayload struct {
-	TurnID int64  `json:"turnId"`
+	EventIdentity
+	TurnID string `json:"turnId"`
 	Step   int64  `json:"step"`
 	StepID string `json:"stepId,omitempty"`
 }
 
 type TurnStepCompletedPayload struct {
-	TurnID       int64         `json:"turnId"`
+	EventIdentity
+	TurnID       string        `json:"turnId"`
 	Step         int64         `json:"step"`
 	StepID       string        `json:"stepId,omitempty"`
 	Usage        *UsagePayload `json:"usage,omitempty"`
 	FinishReason string        `json:"finishReason,omitempty"`
+	EndReason    string        `json:"endReason,omitempty"`
+	EndMessage   string        `json:"endMessage,omitempty"`
+}
+
+type TurnStepRetryingPayload struct {
+	EventIdentity
+	TurnID        string `json:"turnId"`
+	Step          int64  `json:"step"`
+	StepID        string `json:"stepId,omitempty"`
+	FailedAttempt int64  `json:"failedAttempt"`
+	NextAttempt   int64  `json:"nextAttempt"`
+	MaxAttempts   int64  `json:"maxAttempts"`
+	DelayMs       int64  `json:"delayMs"`
+	ErrorName     string `json:"errorName"`
+	ErrorMessage  string `json:"errorMessage"`
+	StatusCode    int64  `json:"statusCode,omitempty"`
 }
 
 type UsagePayload struct {
@@ -139,44 +193,46 @@ type UsagePayload struct {
 	InputCacheCreation int64 `json:"inputCacheCreation"`
 }
 
-type UsageStatusPayload struct {
-	ByModel     map[string]UsagePayload `json:"byModel,omitempty"`
-	CurrentTurn *UsagePayload           `json:"currentTurn,omitempty"`
-	Total       *UsagePayload           `json:"total,omitempty"`
-}
-
 type AgentPhase struct {
 	Kind   string `json:"kind"`
-	TurnID int64  `json:"turnId,omitempty"`
+	TurnID string `json:"turnId,omitempty"`
 	Step   int64  `json:"step,omitempty"`
 	StepID string `json:"stepId,omitempty"`
 }
 
 type AgentStatusPayload struct {
-	Model            string              `json:"model,omitempty"`
-	ThinkingEffort   string              `json:"thinkingEffort,omitempty"`
-	ContextTokens    int64               `json:"contextTokens,omitempty"`
-	MaxContextTokens int64               `json:"maxContextTokens,omitempty"`
-	ContextUsage     float64             `json:"contextUsage,omitempty"`
-	PlanMode         bool                `json:"planMode,omitempty"`
-	SwarmMode        bool                `json:"swarmMode,omitempty"`
-	Permission       string              `json:"permission,omitempty"`
-	Phase            *AgentPhase         `json:"phase,omitempty"`
-	Usage            *UsageStatusPayload `json:"usage,omitempty"`
+	EventIdentity
+	Status         string      `json:"status,omitempty"`
+	Model          string      `json:"model,omitempty"`
+	ThinkingEffort string      `json:"thinkingEffort,omitempty"`
+	Permission     string      `json:"permission,omitempty"`
+	PlanMode       bool        `json:"planMode,omitempty"`
+	SwarmMode      bool        `json:"swarmMode,omitempty"`
+	TowerMode      bool        `json:"towerMode,omitempty"`
+	Phase          *AgentPhase `json:"phase,omitempty"`
+}
+
+type UsageContextPayload struct {
+	EventIdentity
+	ContextTokens    int64 `json:"contextTokens"`
+	MaxContextTokens int64 `json:"maxContextTokens,omitempty"`
 }
 
 type PromptCompletedPayload struct {
+	EventIdentity
 	PromptID   string `json:"promptId"`
 	FinishedAt string `json:"finishedAt"`
 	Reason     string `json:"reason,omitempty"`
 }
 
 type PromptAbortedPayload struct {
+	EventIdentity
 	PromptID  string `json:"promptId"`
 	AbortedAt string `json:"abortedAt"`
 }
 
 type ErrorPayload struct {
+	EventIdentity
 	Code      string `json:"code"`
 	Message   string `json:"message"`
 	Name      string `json:"name,omitempty"`
@@ -184,18 +240,89 @@ type ErrorPayload struct {
 }
 
 type ProtocolErrorPayload struct {
-	Code  int    `json:"code"`
-	Msg   string `json:"msg"`
-	Fatal bool   `json:"fatal"`
+	Code      int             `json:"code"`
+	Msg       string          `json:"msg"`
+	Fatal     bool            `json:"fatal"`
+	RequestID string          `json:"request_id,omitempty"`
+	Details   json.RawMessage `json:"details,omitempty"`
 }
 
 type WarningPayload struct {
+	EventIdentity
 	Message string `json:"message"`
 	Code    string `json:"code,omitempty"`
 }
 
 type WorkChangedPayload struct {
-	Busy           bool   `json:"busy"`
-	MainTurnActive bool   `json:"main_turn_active"`
-	LastTurnReason string `json:"last_turn_reason,omitempty"`
+	EventIdentity
+	Busy               bool   `json:"busy"`
+	MainTurnActive     bool   `json:"main_turn_active"`
+	PendingInteraction string `json:"pending_interaction,omitempty"`
+	LastTurnReason     string `json:"last_turn_reason,omitempty"`
+}
+
+type Task struct {
+	ID               string `json:"task_id"`
+	Kind             string `json:"kind"`
+	Status           string `json:"status"`
+	Outcome          string `json:"outcome,omitempty"`
+	Phase            string `json:"phase,omitempty"`
+	Detached         bool   `json:"detached"`
+	Description      string `json:"description,omitempty"`
+	ChildAgentID     string `json:"child_agent_id,omitempty"`
+	ParentToolCallID string `json:"parent_tool_call_id,omitempty"`
+	SwarmIndex       *int64 `json:"swarm_index,omitempty"`
+	Command          string `json:"command,omitempty"`
+	StartedAt        string `json:"started_at,omitempty"`
+	EndedAt          string `json:"ended_at,omitempty"`
+	ResultSummary    string `json:"result_summary,omitempty"`
+	Error            string `json:"error,omitempty"`
+	StateReason      string `json:"state_reason,omitempty"`
+	Model            string `json:"model,omitempty"`
+	Thinking         string `json:"thinking,omitempty"`
+}
+
+type TaskInfoPayload struct {
+	TaskID           string `json:"taskId"`
+	Status           string `json:"status"`
+	Detached         bool   `json:"detached"`
+	RunInBackground  bool   `json:"runInBackground"`
+	Kind             string `json:"kind,omitempty"`
+	Description      string `json:"description,omitempty"`
+	ChildAgentID     string `json:"childAgentId,omitempty"`
+	ParentToolCallID string `json:"parentToolCallId,omitempty"`
+	SwarmIndex       *int64 `json:"swarmIndex,omitempty"`
+	Command          string `json:"command,omitempty"`
+	StartedAt        string `json:"startedAt,omitempty"`
+	EndedAt          string `json:"endedAt,omitempty"`
+	ResultSummary    string `json:"resultSummary,omitempty"`
+	Error            string `json:"error,omitempty"`
+	StateReason      string `json:"stateReason,omitempty"`
+	Model            string `json:"model,omitempty"`
+	ThinkingEffort   string `json:"thinkingEffort,omitempty"`
+}
+
+type TaskEventPayload struct {
+	EventIdentity
+	Info TaskInfoPayload `json:"info"`
+}
+
+type TaskListPayload struct {
+	EventIdentity
+	Tasks []Task `json:"tasks"`
+}
+
+type TaskOutputPayload struct {
+	EventIdentity
+	TaskID string `json:"taskId"`
+	Offset int64  `json:"offset"`
+	Text   string `json:"text"`
+}
+
+type SubagentSpawnedPayload struct {
+	EventIdentity
+	SubagentID       string `json:"subagentId"`
+	ParentToolCallID string `json:"parentToolCallId,omitempty"`
+	ParentAgentID    string `json:"parentAgentId,omitempty"`
+	Role             string `json:"role,omitempty"`
 }

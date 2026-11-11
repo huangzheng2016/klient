@@ -15,6 +15,7 @@ import (
 type recordedRequest struct {
 	Method        string
 	Path          string
+	RawQuery      string
 	Authorization string
 	ContentType   string
 	Body          string
@@ -30,6 +31,7 @@ func restServer(t *testing.T, responses map[string]string) (*httptest.Server, *r
 		}
 		rec.Method = r.Method
 		rec.Path = r.URL.Path
+		rec.RawQuery = r.URL.RawQuery
 		rec.Authorization = r.Header.Get("Authorization")
 		rec.ContentType = r.Header.Get("Content-Type")
 		rec.Body = string(body)
@@ -103,21 +105,44 @@ func TestCreateSession(t *testing.T) {
 
 func TestGetSnapshot(t *testing.T) {
 	srv, rec := restServer(t, map[string]string{
-		"GET /api/v1/sessions/s1/snapshot": `{"code":0,"msg":"success","data":{"as_of_seq":42,"epoch":"ep1","session":null},"request_id":"r2"}`,
+		"GET /api/v1/sessions/s1":            `{"code":0,"msg":"success","data":{"id":"s1","workspace_id":"w1","title":"t1","busy":true,"main_turn_active":true,"current_prompt_id":"p1","metadata":{"cwd":"/work"},"agent_config":{"model":"k2"},"usage":{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"context_tokens":0}},"request_id":"r2"}`,
+		"GET /api/v1/sessions/s1/transcript": `{"code":0,"msg":"success","data":{"agent_id":"main","items":[{"kind":"turn","turnId":"t4","triggerPromptId":"p1","ordinal":4,"state":"running","origin":{"kind":"user"},"steps":[]}],"has_more":false,"interactions":[],"attachments":[],"prompts":[],"agents":[{"agentId":"main","type":"main"}],"pending_interactions":[],"seq":42},"request_id":"r3"}`,
 	})
 	c := New(srv.URL, "")
 	snap, err := c.GetSnapshot(context.Background(), "s1")
 	if err != nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
-	if snap.AsOfSeq != 42 || snap.Epoch != "ep1" {
+	if snap.Seq == nil || *snap.Seq != 42 || !snap.Session.Busy || !snap.Session.MainTurnActive {
 		t.Fatalf("snapshot = %+v", snap)
 	}
-	if cur := snap.Cursor(); cur.Seq != 42 || cur.Epoch != "ep1" {
+	if snap.InFlightTurn == nil || snap.InFlightTurn.TurnID != "t4" || snap.InFlightTurn.CurrentPromptID != "p1" {
+		t.Fatalf("in-flight turn = %+v", snap.InFlightTurn)
+	}
+	if cur := snap.Cursor(); cur.TranscriptSince["main"] != 42 {
 		t.Fatalf("cursor = %+v", cur)
+	}
+	if rec.Path != "/api/v1/sessions/s1/transcript" || rec.RawQuery != "agent_id=main&page_size=100" {
+		t.Fatalf("transcript request = %s?%s", rec.Path, rec.RawQuery)
 	}
 	if rec.Authorization != "" {
 		t.Fatalf("Authorization = %q, want empty", rec.Authorization)
+	}
+}
+
+func TestGetAgentSnapshot(t *testing.T) {
+	srv, rec := restServer(t, map[string]string{
+		"GET /api/v1/sessions/s1/transcript": `{"code":0,"data":{"agent_id":"agent-0","items":[],"has_more":false,"interactions":[],"attachments":[],"prompts":[],"agents":[{"agentId":"main","type":"main"},{"agentId":"agent-0","type":"sub"}],"pending_interactions":[],"seq":7}}`,
+	})
+	snap, err := New(srv.URL, "").GetAgentSnapshot(context.Background(), "s1", "agent-0")
+	if err != nil {
+		t.Fatalf("GetAgentSnapshot: %v", err)
+	}
+	if snap.AgentID != "agent-0" || snap.Cursor().TranscriptSince["agent-0"] != 7 || len(snap.Agents) != 2 {
+		t.Fatalf("snapshot = %+v", snap)
+	}
+	if rec.RawQuery != "agent_id=agent-0&page_size=100" {
+		t.Fatalf("query = %q", rec.RawQuery)
 	}
 }
 
@@ -169,46 +194,30 @@ func TestAbort(t *testing.T) {
 }
 
 func TestSteerPrompts(t *testing.T) {
-	var recs []recordedRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read request body: %v", err)
-		}
-		recs = append(recs, recordedRequest{
-			Method:        r.Method,
-			Path:          r.URL.Path,
-			Authorization: r.Header.Get("Authorization"),
-			ContentType:   r.Header.Get("Content-Type"),
-			Body:          string(body),
-		})
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"code":0,"msg":"success","data":{"steered":true,"prompt_ids":["p1"]},"request_id":"r6"}`)
-	}))
-	t.Cleanup(srv.Close)
+	srv, rec := restServer(t, map[string]string{
+		"POST /api/v1/sessions/s1/prompts::steer": `{"code":0,"msg":"success","data":{"steered":true,"prompt_ids":["p1","p2"]},"request_id":"r6"}`,
+	})
 	c := New(srv.URL, "tok")
 	if err := c.SteerPrompts(context.Background(), "s1", []string{"p1", "p2"}); err != nil {
 		t.Fatalf("SteerPrompts: %v", err)
 	}
-	if len(recs) != 2 {
-		t.Fatalf("requests = %d, want 2 (one per prompt id)", len(recs))
+	if rec.Method != http.MethodPost || rec.Path != "/api/v1/sessions/s1/prompts::steer" {
+		t.Fatalf("request = %s %s", rec.Method, rec.Path)
 	}
-	for i, want := range []string{"/api/v1/sessions/s1/prompts/p1:steer", "/api/v1/sessions/s1/prompts/p2:steer"} {
-		if recs[i].Method != http.MethodPost || recs[i].Path != want {
-			t.Fatalf("request[%d] = %s %s, want POST %s", i, recs[i].Method, recs[i].Path, want)
-		}
-		if recs[i].Authorization != "Bearer tok" {
-			t.Fatalf("request[%d] Authorization = %q", i, recs[i].Authorization)
-		}
-		if recs[i].Body != "{}" {
-			t.Fatalf("request[%d] body = %q, want {}", i, recs[i].Body)
-		}
+	if rec.Authorization != "Bearer tok" {
+		t.Fatalf("Authorization = %q", rec.Authorization)
+	}
+	var body struct {
+		PromptIDs []string `json:"prompt_ids"`
+	}
+	if err := json.Unmarshal([]byte(rec.Body), &body); err != nil || len(body.PromptIDs) != 2 || body.PromptIDs[0] != "p1" || body.PromptIDs[1] != "p2" {
+		t.Fatalf("body = %s, err = %v", rec.Body, err)
 	}
 }
 
 func TestSteerPromptsAPIError(t *testing.T) {
 	srv, _ := restServer(t, map[string]string{
-		"POST /api/v1/sessions/s1/prompts/p1:steer": `{"code":40402,"msg":"one or more prompts are not pending","data":null,"request_id":"r7"}`,
+		"POST /api/v1/sessions/s1/prompts::steer": `{"code":40402,"msg":"one or more prompts are not pending","data":null,"request_id":"r7"}`,
 	})
 	c := New(srv.URL, "tok")
 	err := c.SteerPrompts(context.Background(), "s1", []string{"p1"})
@@ -226,7 +235,7 @@ func TestSteerPromptsAPIError(t *testing.T) {
 
 func TestAPIError(t *testing.T) {
 	srv, _ := restServer(t, map[string]string{
-		"GET /api/v1/sessions/nope/snapshot": `{"code":40401,"msg":"session nope does not exist","data":null,"request_id":"r5"}`,
+		"GET /api/v1/sessions/nope": `{"code":40401,"msg":"session nope does not exist","data":null,"request_id":"r5"}`,
 	})
 	c := New(srv.URL, "tok")
 	_, err := c.GetSnapshot(context.Background(), "nope")
@@ -340,18 +349,37 @@ func TestDoRejectsOversizedResponse(t *testing.T) {
 	}
 }
 
-func TestLifecycleSnapshotAndTaskContract(t *testing.T) {
-	srv, _ := restServer(t, map[string]string{
-		"GET /api/v1/sessions/s1/snapshot": `{"code":0,"data":{"as_of_seq":17,"epoch":"ep2","session":{"busy":true,"main_turn_active":true},"in_flight_turn":{"turn_id":4,"current_prompt_id":"p1","assistant_text":"","thinking_text":"","running_tools":[]},"messages":{"items":[{"metadata":{"origin":{"kind":"task","taskId":"task-1"}}}],"has_more":false}}}`,
-		"GET /api/v1/sessions/s1/tasks":    `{"code":0,"data":{"items":[{"id":"task-1","session_id":"s1","kind":"bash","description":"test","status":"completed","created_at":"2026-10-30T00:00:00Z","completed_at":"2026-10-30T00:01:00Z","run_in_background":true}]}}`,
+func TestSessionRestoreAndReload(t *testing.T) {
+	srv, rec := restServer(t, map[string]string{
+		"POST /api/v1/sessions/s1:restore": `{"code":0,"data":{"id":"s1","workspace_id":"w1","busy":false,"archived":false,"metadata":{"cwd":"/work"},"agent_config":{"model":"k2"},"usage":{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"context_tokens":0}}}`,
+		"POST /api/v1/sessions/s1:reload":  `{"code":0,"data":{"id":"s1","workspace_id":"w1","busy":false,"archived":false,"metadata":{"cwd":"/work"},"agent_config":{"model":"k2"},"usage":{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"context_tokens":0}}}`,
 	})
 	client := New(srv.URL, "")
-	snapshot, err := client.GetSnapshot(context.Background(), "s1")
-	if err != nil || !snapshot.Session.Busy || !snapshot.Session.MainTurnActive || snapshot.InFlightTurn == nil || snapshot.InFlightTurn.TurnID != 4 || snapshot.Messages.Items[0].Metadata.Origin.TaskID != "task-1" {
-		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
+	session, err := client.RestoreSession(context.Background(), "s1")
+	if err != nil || session.ID != "s1" || session.Archived {
+		t.Fatalf("RestoreSession = %+v, err = %v", session, err)
 	}
-	tasks, err := client.ListTasks(context.Background(), "s1")
-	if err != nil || len(tasks) != 1 || tasks[0].ID != "task-1" || tasks[0].Status != "completed" || !tasks[0].RunInBackground || tasks[0].CompletedAt != "2026-10-30T00:01:00Z" {
-		t.Fatalf("tasks=%+v err=%v", tasks, err)
+	if rec.Path != "/api/v1/sessions/s1:restore" || rec.Body != "{}" {
+		t.Fatalf("restore request = %s %s", rec.Path, rec.Body)
+	}
+	session, err = client.ReloadSession(context.Background(), "s1")
+	if err != nil || session.ID != "s1" {
+		t.Fatalf("ReloadSession = %+v, err = %v", session, err)
+	}
+	if rec.Path != "/api/v1/sessions/s1:reload" || rec.Body != "{}" {
+		t.Fatalf("reload request = %s %s", rec.Path, rec.Body)
+	}
+}
+
+func TestListMCPServers(t *testing.T) {
+	srv, rec := restServer(t, map[string]string{
+		"GET /api/v1/mcp/servers": `{"code":0,"data":{"servers":[{"id":"mcp-1","name":"mcp-1","transport":"stdio","status":"running","tool_count":3,"next_retry_at":123}]}}`,
+	})
+	servers, err := New(srv.URL, "").ListMCPServers(context.Background())
+	if err != nil || len(servers) != 1 || servers[0].ID != "mcp-1" || servers[0].Name != "mcp-1" || servers[0].ToolCount != 3 || servers[0].NextRetryAt != 123 {
+		t.Fatalf("ListMCPServers = %+v, err = %v", servers, err)
+	}
+	if rec.RawQuery != "" {
+		t.Fatalf("query = %q, want empty", rec.RawQuery)
 	}
 }
