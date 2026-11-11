@@ -5,7 +5,7 @@ Lightweight Go client for the Kimi Agent Protocol served by Kimi Code 2.5.3 (`ki
 ## Install
 
 ```bash
-go get github.com/huangzheng2016/klient
+go get github.com/huangzheng2016/klient/v2
 ```
 
 ## Features
@@ -53,7 +53,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/huangzheng2016/klient"
+	"github.com/huangzheng2016/klient/v2"
 )
 
 func main() {

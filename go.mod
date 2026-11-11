@@ -1,4 +1,4 @@
-module github.com/huangzheng2016/klient
+module github.com/huangzheng2016/klient/v2
 
 go 1.23
 
