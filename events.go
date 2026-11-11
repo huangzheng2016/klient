@@ -95,7 +95,7 @@ type TurnEndedPayload struct {
 	PromptID        string        `json:"promptId,omitempty"`
 	Reason          string        `json:"reason"`
 	Error           *ErrorPayload `json:"error,omitempty"`
-	DurationMs      int64         `json:"durationMs,omitempty"`
+	DurationMs      float64       `json:"durationMs,omitempty"`
 	InterruptReason string        `json:"interruptReason,omitempty"`
 	TraceID         string        `json:"traceId,omitempty"`
 }
@@ -174,23 +174,23 @@ type TurnStepCompletedPayload struct {
 
 type TurnStepRetryingPayload struct {
 	EventIdentity
-	TurnID        string `json:"turnId"`
-	Step          int64  `json:"step"`
-	StepID        string `json:"stepId,omitempty"`
-	FailedAttempt int64  `json:"failedAttempt"`
-	NextAttempt   int64  `json:"nextAttempt"`
-	MaxAttempts   int64  `json:"maxAttempts"`
-	DelayMs       int64  `json:"delayMs"`
-	ErrorName     string `json:"errorName"`
-	ErrorMessage  string `json:"errorMessage"`
-	StatusCode    int64  `json:"statusCode,omitempty"`
+	TurnID        string  `json:"turnId"`
+	Step          int64   `json:"step"`
+	StepID        string  `json:"stepId,omitempty"`
+	FailedAttempt float64 `json:"failedAttempt"`
+	NextAttempt   float64 `json:"nextAttempt"`
+	MaxAttempts   float64 `json:"maxAttempts"`
+	DelayMs       float64 `json:"delayMs"`
+	ErrorName     string  `json:"errorName"`
+	ErrorMessage  string  `json:"errorMessage"`
+	StatusCode    float64 `json:"statusCode,omitempty"`
 }
 
 type UsagePayload struct {
-	InputOther         int64 `json:"inputOther"`
-	Output             int64 `json:"output"`
-	InputCacheRead     int64 `json:"inputCacheRead"`
-	InputCacheCreation int64 `json:"inputCacheCreation"`
+	InputOther         float64 `json:"inputOther"`
+	Output             float64 `json:"output"`
+	InputCacheRead     float64 `json:"inputCacheRead"`
+	InputCacheCreation float64 `json:"inputCacheCreation"`
 }
 
 type AgentPhase struct {

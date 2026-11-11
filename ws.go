@@ -128,6 +128,7 @@ func (c *Client) subscribe(ctx context.Context, sessionID string, cursor Cursor)
 	if err != nil {
 		return nil, err
 	}
+	mapper.snapshotSource = c.GetAgentSnapshot
 	keepMapper := false
 	defer func() {
 		if !keepMapper {
@@ -364,7 +365,7 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn, ch chan<- E
 
 	process := func(frame wsFrame) bool {
 		working := mapper.clone()
-		events, fatal, err := mapWSFrame(working, frame)
+		events, fatal, err := mapWSFrame(ctx, working, frame)
 		if err != nil {
 			emitStreamError(ctx, ch, err)
 			return false
@@ -431,7 +432,7 @@ func runWSReader(ctx context.Context, conn *websocket.Conn, pending []wsFrame, r
 	}
 }
 
-func mapWSFrame(mapper *transcriptEventMapper, frame wsFrame) ([]Event, bool, error) {
+func mapWSFrame(ctx context.Context, mapper *transcriptEventMapper, frame wsFrame) ([]Event, bool, error) {
 	switch frame.Type {
 	case "server_hello", "ack", "pong":
 		return nil, false, nil
@@ -460,7 +461,7 @@ func mapWSFrame(mapper *transcriptEventMapper, frame wsFrame) ([]Event, bool, er
 		if err := json.Unmarshal(frame.Payload, &p); err != nil {
 			return nil, false, fmt.Errorf("klient: decode transcript ops: %w", err)
 		}
-		events, err := mapper.applyOps(p)
+		events, err := mapper.applyOps(ctx, p)
 		indexTranscriptEvents(events)
 		return events, false, err
 	case "agent":

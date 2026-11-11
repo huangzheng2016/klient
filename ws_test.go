@@ -15,11 +15,12 @@ import (
 )
 
 type wsTestServer struct {
-	srv        *httptest.Server
-	auth       chan string
-	hello      chan wsClientHello
-	sub        chan wsSubscribe
-	handlerErr chan error
+	srv          *httptest.Server
+	auth         chan string
+	hello        chan wsClientHello
+	sub          chan wsSubscribe
+	handlerErr   chan error
+	restResponse string
 }
 
 func newWSTestServer(t *testing.T, script func(ctx context.Context, conn *websocket.Conn)) *wsTestServer {
@@ -35,6 +36,15 @@ func newWSTestServerHandshake(t *testing.T, ack string, preAck [][]byte, script 
 		handlerErr: make(chan error, 1),
 	}
 	ts.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/ws" {
+			if ts.restResponse == "" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(ts.restResponse))
+			return
+		}
 		ts.auth <- r.Header.Get("Authorization")
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -1132,4 +1142,112 @@ func TestCloseWhileDeliveryAndReaderBlocked(t *testing.T) {
 	if active {
 		t.Fatal("session remained active after Subscription.Close")
 	}
+}
+
+func TestTranscriptRetryUsageAndDurationDecimals(t *testing.T) {
+	ts := newWSTestServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		_ = writeAll(ctx, conn,
+			transcriptReset("main", 0, ""),
+			transcriptOps("main", 1,
+				`{"op":"step.upsert","turnId":"t1","step":{"kind":"step","stepId":"t1.81","turnId":"t1","ordinal":81,"state":"running","retry":{"failedAttempt":1.5,"nextAttempt":2.5,"maxAttempts":10.5,"delayMs":571.0463109781039,"errorName":"ProviderError","errorMessage":"slow","statusCode":429.5}}}`),
+			transcriptOps("main", 2,
+				`{"op":"step.upsert","turnId":"t1","step":{"kind":"step","stepId":"t1.81","turnId":"t1","ordinal":81,"state":"completed","usage":{"inputOther":1.25,"output":2.5,"inputCacheRead":3.75,"inputCacheCreation":4.125},"finishReason":"stop"}}`),
+			transcriptOps("main", 3,
+				`{"op":"turn.upsert","turn":{"kind":"turn","turnId":"t1","ordinal":1,"state":"completed","origin":{"kind":"user"},"durationMs":12.75}}`))
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	sub, err := New(ts.srv.URL, "").Subscribe(context.Background(), "s1", Cursor{})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+	if ev := recvEvent(t, sub.Events); ev.Type != TypeTurnStepStarted {
+		t.Fatalf("first event = %+v", ev)
+	}
+	retryEvent := recvEvent(t, sub.Events)
+	var retry TurnStepRetryingPayload
+	if retryEvent.Type != TypeTurnStepRetrying || retryEvent.Decode(&retry) != nil {
+		t.Fatalf("retry event = %+v", retryEvent)
+	}
+	if retry.DelayMs != 571.0463109781039 || retry.FailedAttempt != 1.5 || retry.NextAttempt != 2.5 ||
+		retry.MaxAttempts != 10.5 || retry.StatusCode != 429.5 {
+		t.Fatalf("retry payload = %+v", retry)
+	}
+	stepEvent := recvEvent(t, sub.Events)
+	var step TurnStepCompletedPayload
+	if stepEvent.Type != TypeTurnStepComplete || stepEvent.Decode(&step) != nil || step.Usage == nil {
+		t.Fatalf("step event = %+v", stepEvent)
+	}
+	if step.Usage.InputOther != 1.25 || step.Usage.Output != 2.5 || step.Usage.InputCacheRead != 3.75 || step.Usage.InputCacheCreation != 4.125 {
+		t.Fatalf("usage payload = %+v", step.Usage)
+	}
+	mapper := &KAPMapper{}
+	kind, payload, ok := mapper.Map(stepEvent)
+	if !ok || kind != "usage" || !strings.Contains(string(payload), `"input_tokens":9.125`) || !strings.Contains(string(payload), `"output_tokens":2.5`) {
+		t.Fatalf("mapped usage = %s %s %t", kind, payload, ok)
+	}
+	turnEvent := recvEvent(t, sub.Events)
+	var ended TurnEndedPayload
+	if turnEvent.Type != TypeTurnEnded || turnEvent.Decode(&ended) != nil || ended.DurationMs != 12.75 {
+		t.Fatalf("turn event = %+v payload = %+v", turnEvent, ended)
+	}
+	waitClosed(t, sub.Events)
+}
+
+func TestOperationResetSnapshotSupportsLargeAppendOffset(t *testing.T) {
+	text := strings.Repeat("x", 531)
+	snapshot := fmt.Sprintf(`{"items":[{"kind":"turn","turnId":"t1","ordinal":1,"state":"running","origin":{"kind":"user"},"steps":[{"kind":"step","stepId":"t1.81","turnId":"t1","ordinal":81,"state":"running","frames":[{"kind":"text","frameId":"f1","role":"assistant","text":%q}]}]}],"interactions":[],"attachments":[],"prompts":[]}`, text)
+	ts := newWSTestServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		_ = writeAll(ctx, conn,
+			transcriptReset("main", 0, ""),
+			transcriptOps("main", 1, `{"op":"reset","agentId":"main","snapshot":`+snapshot+`}`),
+			transcriptOps("main", 2,
+				`{"op":"append","target":{"type":"frame","turnId":"t1","stepId":"t1.81","frameId":"f1"},"offset":531,"text":"y"}`))
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	sub, err := New(ts.srv.URL, "").Subscribe(context.Background(), "s1", Cursor{})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+	for range 3 {
+		_ = recvEvent(t, sub.Events)
+	}
+	ev := recvEvent(t, sub.Events)
+	var p AssistantDeltaPayload
+	if ev.Type != TypeAssistantDelta || ev.Decode(&p) != nil || p.Delta != "y" {
+		t.Fatalf("append after reset = %+v payload = %+v", ev, p)
+	}
+	waitClosed(t, sub.Events)
+}
+
+func TestTruncatedResetRestoresAppendBaseline(t *testing.T) {
+	text := strings.Repeat("x", 531)
+	snapshot := fmt.Sprintf(`{"items":[{"kind":"turn","turnId":"t1","ordinal":1,"state":"running","origin":{"kind":"user"},"steps":[{"kind":"step","stepId":"t1.81","turnId":"t1","ordinal":81,"state":"running","frames":[{"kind":"text","frameId":"f1","role":"assistant","text":%q}]}]}],"interactions":[],"attachments":[],"prompts":[]}`, text+"yz")
+	reset := []byte(strings.Replace(string(transcriptReset("main", 0, "")), `"has_more_older":false`, `"has_more_older":true`, 1))
+	ts := newWSTestServer(t, func(ctx context.Context, conn *websocket.Conn) {
+		_ = writeAll(ctx, conn,
+			reset,
+			transcriptOps("main", 1,
+				`{"op":"append","target":{"type":"frame","turnId":"t1","stepId":"t1.81","frameId":"f1"},"offset":531,"text":"y"}`),
+			transcriptOps("main", 2,
+				`{"op":"append","target":{"type":"frame","turnId":"t1","stepId":"t1.81","frameId":"f1"},"offset":532,"text":"z"}`))
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	})
+	ts.restResponse = fmt.Sprintf(`{"code":0,"msg":"success","data":%s}`, snapshot)
+	sub, err := New(ts.srv.URL, "").Subscribe(context.Background(), "s1", Cursor{})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+	ev := recvEvent(t, sub.Events)
+	var p AssistantDeltaPayload
+	if ev.Type != TypeAssistantDelta || ev.Decode(&p) != nil || p.Delta != "y" {
+		t.Fatalf("append after truncated reset = %+v payload = %+v", ev, p)
+	}
+	ev = recvEvent(t, sub.Events)
+	if ev.Type != TypeAssistantDelta || ev.Decode(&p) != nil || p.Delta != "z" {
+		t.Fatalf("second append after truncated reset = %+v payload = %+v", ev, p)
+	}
+	waitClosed(t, sub.Events)
 }

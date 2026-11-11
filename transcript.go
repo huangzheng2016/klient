@@ -1,6 +1,7 @@
 package klient
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"unicode/utf16"
@@ -19,19 +20,19 @@ type TranscriptTurn struct {
 	StartedAt       string           `json:"startedAt,omitempty"`
 	EndedAt         string           `json:"endedAt,omitempty"`
 	Usage           json.RawMessage  `json:"usage,omitempty"`
-	DurationMs      int64            `json:"durationMs,omitempty"`
+	DurationMs      float64          `json:"durationMs,omitempty"`
 	Error           string           `json:"error,omitempty"`
 	Wedged          bool             `json:"wedged,omitempty"`
 }
 
 type TranscriptStepRetry struct {
-	FailedAttempt int64  `json:"failedAttempt"`
-	NextAttempt   int64  `json:"nextAttempt"`
-	MaxAttempts   int64  `json:"maxAttempts"`
-	DelayMs       int64  `json:"delayMs"`
-	ErrorName     string `json:"errorName"`
-	ErrorMessage  string `json:"errorMessage"`
-	StatusCode    int64  `json:"statusCode,omitempty"`
+	FailedAttempt float64 `json:"failedAttempt"`
+	NextAttempt   float64 `json:"nextAttempt"`
+	MaxAttempts   float64 `json:"maxAttempts"`
+	DelayMs       float64 `json:"delayMs"`
+	ErrorName     string  `json:"errorName"`
+	ErrorMessage  string  `json:"errorMessage"`
+	StatusCode    float64 `json:"statusCode,omitempty"`
 }
 
 type TranscriptStep struct {
@@ -108,7 +109,7 @@ type TranscriptItem struct {
 	StartedAt       string           `json:"startedAt,omitempty"`
 	EndedAt         string           `json:"endedAt,omitempty"`
 	Usage           json.RawMessage  `json:"usage,omitempty"`
-	DurationMs      int64            `json:"durationMs,omitempty"`
+	DurationMs      float64          `json:"durationMs,omitempty"`
 	Error           string           `json:"error,omitempty"`
 	Wedged          bool             `json:"wedged,omitempty"`
 	MarkerID        string           `json:"markerId,omitempty"`
@@ -234,11 +235,12 @@ func newAgentEventState() *agentEventState {
 }
 
 type transcriptEventMapper struct {
-	sessionID   string
-	cursor      Cursor
-	agents      map[string]*agentEventState
-	promptEmits map[string]string
-	resetKeys   map[string]string
+	sessionID      string
+	cursor         Cursor
+	agents         map[string]*agentEventState
+	promptEmits    map[string]string
+	resetKeys      map[string]string
+	snapshotSource func(context.Context, string, string) (*Snapshot, error)
 }
 
 func newTranscriptEventMapper(sessionID string, cursor Cursor) *transcriptEventMapper {
@@ -289,11 +291,12 @@ func (m *transcriptEventMapper) cursorSnapshot() Cursor {
 
 func (m *transcriptEventMapper) clone() *transcriptEventMapper {
 	out := &transcriptEventMapper{
-		sessionID:   m.sessionID,
-		cursor:      m.cursor.clone(),
-		agents:      make(map[string]*agentEventState, len(m.agents)),
-		promptEmits: make(map[string]string, len(m.promptEmits)),
-		resetKeys:   make(map[string]string, len(m.resetKeys)),
+		sessionID:      m.sessionID,
+		cursor:         m.cursor.clone(),
+		agents:         make(map[string]*agentEventState, len(m.agents)),
+		promptEmits:    make(map[string]string, len(m.promptEmits)),
+		resetKeys:      make(map[string]string, len(m.resetKeys)),
+		snapshotSource: m.snapshotSource,
 	}
 	for agentID, state := range m.agents {
 		cloned := newAgentEventState()
@@ -413,7 +416,7 @@ func (m *transcriptEventMapper) applyResetOperation(agentID string, snapshot tra
 	return m.applySnapshot(agentID, state, snapshot, seq)
 }
 
-func (m *transcriptEventMapper) applyOps(p transcriptOpsPayload) ([]Event, error) {
+func (m *transcriptEventMapper) applyOps(ctx context.Context, p transcriptOpsPayload) ([]Event, error) {
 	if p.AgentID == "" {
 		return nil, fmt.Errorf("klient: transcript ops missing agent_id")
 	}
@@ -443,7 +446,7 @@ func (m *transcriptEventMapper) applyOps(p transcriptOpsPayload) ([]Event, error
 	events := make([]Event, 0)
 	for _, op := range p.Ops {
 		state = m.agents[p.AgentID]
-		mapped, err := m.applyOperation(p.AgentID, state, op, *p.Seq)
+		mapped, err := m.applyOperation(ctx, p.AgentID, state, op, *p.Seq)
 		if err != nil {
 			return nil, err
 		}
@@ -542,7 +545,7 @@ func (m *transcriptEventMapper) applySnapshot(agentID string, state *agentEventS
 	return events, nil
 }
 
-func (m *transcriptEventMapper) applyOperation(agentID string, state *agentEventState, op transcriptOperation, seq int64) ([]Event, error) {
+func (m *transcriptEventMapper) applyOperation(ctx context.Context, agentID string, state *agentEventState, op transcriptOperation, seq int64) ([]Event, error) {
 	switch op.Op {
 	case "reset":
 		if op.Snapshot == nil {
@@ -556,7 +559,7 @@ func (m *transcriptEventMapper) applyOperation(agentID string, state *agentEvent
 	case "frame.upsert":
 		return m.applyFrame(agentID, state, op.TurnID, op.StepID, op.Frame, seq)
 	case "append":
-		return m.applyAppend(agentID, state, op, seq)
+		return m.applyAppend(ctx, agentID, state, op, seq)
 	case "marker.upsert":
 		return m.applyMarker(agentID, op.Item, seq)
 	case "prompt.upsert":
@@ -803,11 +806,56 @@ func (m *transcriptEventMapper) applyToolFrame(agentID string, current *frameEve
 	return events, nil
 }
 
-func (m *transcriptEventMapper) applyAppend(agentID string, state *agentEventState, op transcriptOperation, seq int64) ([]Event, error) {
+func (m *transcriptEventMapper) restoreAppendTarget(ctx context.Context, agentID string, state *agentEventState, target transcriptAppendTarget, offset int64) error {
+	snapshot, err := m.snapshotSource(ctx, m.sessionID, agentID)
+	if err != nil {
+		return fmt.Errorf("load transcript baseline: %w", err)
+	}
+	for _, item := range snapshot.Items {
+		if item.Kind != "turn" || item.TurnID != target.TurnID {
+			continue
+		}
+		for _, step := range item.Steps {
+			if step.StepID != target.StepID {
+				continue
+			}
+			for _, frame := range step.Frames {
+				if frame.FrameID != target.FrameID {
+					continue
+				}
+				if frame.Kind != "text" && frame.Kind != "thinking" {
+					return fmt.Errorf("baseline target is not text")
+				}
+				units := transcriptFrameTextUnits(frame)
+				if int64(len(units)) < offset {
+					return fmt.Errorf("baseline length %d is below append offset %d", len(units), offset)
+				}
+				units = cloneUTF16(units[:int(offset)])
+				frame.Text = string(utf16.Decode(units))
+				frame.textUnits = units
+				current := &frameEventState{
+					turnID: target.TurnID, stepID: target.StepID, frame: frame,
+					textUnits: units, pendingText: trailingHighSurrogate(units),
+				}
+				state.frames[frameKey(target.TurnID, target.StepID, target.FrameID)] = current
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("baseline frame %s/%s/%s not found", target.TurnID, target.StepID, target.FrameID)
+}
+
+func (m *transcriptEventMapper) applyAppend(ctx context.Context, agentID string, state *agentEventState, op transcriptOperation, seq int64) ([]Event, error) {
 	target := op.Target
 	offset := op.Offset
 	key := frameKey(target.TurnID, target.StepID, target.FrameID)
 	current := state.frames[key]
+	if current == nil && m.snapshotSource != nil {
+		if err := m.restoreAppendTarget(ctx, agentID, state, target, offset); err != nil {
+			return nil, &TranscriptGapError{AgentID: agentID, Expected: 0, Got: offset, Detail: "append target is unavailable: " + err.Error()}
+		}
+		current = state.frames[key]
+	}
 	if current == nil {
 		return nil, &TranscriptGapError{AgentID: agentID, Expected: 0, Got: offset, Detail: "append target is unavailable"}
 	}
@@ -994,7 +1042,7 @@ func transcriptStepTerminalKey(step TranscriptStep) string {
 }
 
 func transcriptStepRetryKey(retry *TranscriptStepRetry) string {
-	return fmt.Sprintf("%d/%d/%d/%s", retry.FailedAttempt, retry.NextAttempt, retry.DelayMs, retry.ErrorMessage)
+	return fmt.Sprintf("%g/%g/%g/%s", retry.FailedAttempt, retry.NextAttempt, retry.DelayMs, retry.ErrorMessage)
 }
 
 func terminalTurnState(state string) bool {

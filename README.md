@@ -30,6 +30,8 @@ go get github.com/huangzheng2016/klient/v2
   - Tracks per-agent sequence cursors, suppresses replay duplicates, and detects sequence and append gaps.
   - Numbers each mapped transcript event with `EventIndex` from zero within its WS reset/ops frame. `(AgentID, Seq, EventIndex)` is the batch-scoped deduplication key for transcript events; lifecycle events with `Seq=0` do not use that key.
   - Applies external `transcript.reset` incrementally against cached state so old frames are not replayed, while explicit `op=reset` retains its clearing/undo semantics.
+  - Restores a missing append target from the REST transcript when a reset truncated its frame, using only the text preceding the append offset so newer WebSocket events are not suppressed; missing or shorter baselines remain explicit errors.
+  - Preserves decimal retry, usage, and turn-duration numbers from the 2.5.3 schema.
   - Reads raw frames and answers ping independently of transcript mapping and event delivery, so a slow consumer cannot block heartbeat responses.
   - Uses a bounded 64-frame raw queue. Saturation closes the connection and surfaces `klient.read_error` after already queued events, allowing replay from the last committed cursor without silently dropping frames.
   - Commits cursor and cache only after every mapped event in a transcript batch has been received. Closing mid-batch replays that batch on reconnect, favoring duplicates over event loss.
