@@ -241,9 +241,13 @@ func (c *Client) SteerPrompts(ctx context.Context, sessionID string, promptIDs [
 	if len(promptIDs) == 0 {
 		return nil
 	}
-	body := map[string]any{"prompt_ids": promptIDs}
-	path := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/prompts::steer"
-	return c.do(ctx, http.MethodPost, path, body, nil)
+	for _, promptID := range promptIDs {
+		path := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/prompts/" + url.PathEscape(promptID) + ":steer"
+		if err := c.do(ctx, http.MethodPost, path, struct{}{}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Client) Subscribe(ctx context.Context, sessionID string, cursor Cursor) (*Subscription, error) {

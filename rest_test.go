@@ -195,29 +195,27 @@ func TestAbort(t *testing.T) {
 
 func TestSteerPrompts(t *testing.T) {
 	srv, rec := restServer(t, map[string]string{
-		"POST /api/v1/sessions/s1/prompts::steer": `{"code":0,"msg":"success","data":{"steered":true,"prompt_ids":["p1","p2"]},"request_id":"r6"}`,
+		"POST /api/v1/sessions/s1/prompts/p1:steer": `{"code":0,"msg":"success","data":{"steered":true,"prompt_ids":["p1"]},"request_id":"r6"}`,
+		"POST /api/v1/sessions/s1/prompts/p2:steer": `{"code":0,"msg":"success","data":{"steered":true,"prompt_ids":["p2"]},"request_id":"r6"}`,
 	})
 	c := New(srv.URL, "tok")
 	if err := c.SteerPrompts(context.Background(), "s1", []string{"p1", "p2"}); err != nil {
 		t.Fatalf("SteerPrompts: %v", err)
 	}
-	if rec.Method != http.MethodPost || rec.Path != "/api/v1/sessions/s1/prompts::steer" {
+	if rec.Method != http.MethodPost || rec.Path != "/api/v1/sessions/s1/prompts/p2:steer" {
 		t.Fatalf("request = %s %s", rec.Method, rec.Path)
 	}
 	if rec.Authorization != "Bearer tok" {
 		t.Fatalf("Authorization = %q", rec.Authorization)
 	}
-	var body struct {
-		PromptIDs []string `json:"prompt_ids"`
-	}
-	if err := json.Unmarshal([]byte(rec.Body), &body); err != nil || len(body.PromptIDs) != 2 || body.PromptIDs[0] != "p1" || body.PromptIDs[1] != "p2" {
-		t.Fatalf("body = %s, err = %v", rec.Body, err)
+	if rec.Body != "{}" {
+		t.Fatalf("body = %q, want {}", rec.Body)
 	}
 }
 
 func TestSteerPromptsAPIError(t *testing.T) {
 	srv, _ := restServer(t, map[string]string{
-		"POST /api/v1/sessions/s1/prompts::steer": `{"code":40402,"msg":"one or more prompts are not pending","data":null,"request_id":"r7"}`,
+		"POST /api/v1/sessions/s1/prompts/p1:steer": `{"code":40402,"msg":"one or more prompts are not pending","data":null,"request_id":"r7"}`,
 	})
 	c := New(srv.URL, "tok")
 	err := c.SteerPrompts(context.Background(), "s1", []string{"p1"})
